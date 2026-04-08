@@ -4,5 +4,11 @@
         "type": "bool",
         "default": false,
         "hint": "启用后，当本群没有该用户的怪话记录时，会搜索其他群的记录。默认关闭。"
+    },
+    "debug_log": {
+        "description": "调试日志",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，会在 AstrBot 平台日志输出 Wackee 的调试信息，便于排查 @ 识别和目标匹配问题。默认关闭。"
     }
 }

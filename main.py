@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -12,7 +13,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
 
-@register("astrbot_plugin_wackee", "storyAura", "记录群友怪话、统计排行并随机发送", "1.1.0")
+@register("astrbot_plugin_wackee", "storyAura", "记录群友怪话、统计排行并随机发送", "1.1.2")
 class Wackee(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context, config)
@@ -41,6 +42,22 @@ class Wackee(Star):
             f"[Wackee] 怪话记录器已加载，共 {total_users} 位用户，"
             f"{total_records} 条唯一记录，累计出现 {total_occurrences} 次"
         )
+
+    def _get_config_bool(self, key: str, default: bool = False) -> bool:
+        if not self.config:
+            return default
+
+        try:
+            return bool(self.config.get(key, default))
+        except Exception:
+            return default
+
+    def _is_debug_enabled(self) -> bool:
+        return self._get_config_bool("debug_log", False)
+
+    def _debug_log(self, message: str):
+        if self._is_debug_enabled():
+            logger.info(f"[Wackee][debug] {message}")
 
     # ==================== 数据持久化 ====================
 
@@ -221,6 +238,220 @@ class Wackee(Star):
             ),
         )
 
+    def _extract_command_tail(self, message_text: str, command_name: str) -> str:
+        text = (message_text or "").strip()
+        text = re.sub(r"^[\/／!！]+", "", text).lstrip()
+
+        if text.startswith(command_name):
+            text = text[len(command_name) :]
+
+        return text.strip()
+
+    def _clean_target_name(self, target_text: str) -> str:
+        text = (target_text or "").strip()
+        text = re.sub(r"^[\s@＠]+", "", text)
+        return " ".join(text.split()).strip()
+
+    def _normalize_match_name(self, name: str) -> str:
+        return "".join((name or "").split()).casefold()
+
+    def _get_member_value(self, member, key: str) -> str:
+        if isinstance(member, dict):
+            value = member.get(key, "")
+        else:
+            value = getattr(member, key, "")
+        return str(value or "").strip()
+
+    def _collect_member_match_names(self, member) -> list[str]:
+        names = []
+        seen = set()
+
+        for key in ("card", "nickname", "display_name", "remark", "sender_name"):
+            name = self._get_member_value(member, key)
+            if not name:
+                continue
+
+            normalized_name = self._normalize_match_name(name)
+            if not normalized_name or normalized_name in seen:
+                continue
+
+            names.append(name)
+            seen.add(normalized_name)
+
+        return names
+
+    async def _fetch_aiocqhttp_group_members(self, event: AstrMessageEvent, group_id: str):
+        if event.get_platform_name() != "aiocqhttp":
+            return []
+
+        bot = getattr(event, "bot", None)
+        if not bot or not hasattr(bot, "call_action"):
+            return []
+
+        query_group_id = int(group_id) if str(group_id).isdigit() else group_id
+
+        try:
+            members = await bot.call_action(
+                "get_group_member_list",
+                group_id=query_group_id,
+            )
+            if isinstance(members, list):
+                self._debug_log(
+                    f"读取 aiocqhttp 原始群成员成功: group_id={group_id}, "
+                    f"member_count={len(members)}"
+                )
+                return members
+        except Exception as e:
+            self._debug_log(
+                f"读取 aiocqhttp 原始群成员失败: group_id={group_id}, error={e}"
+            )
+
+        return []
+
+    def _get_group_recorded_name(
+        self, group_id: str, user_id: str, fallback_name: str = ""
+    ) -> str:
+        group_data = self.data.get("groups", {}).get(group_id, {})
+        user_data = group_data.get(str(user_id), {})
+        sender_name = str(user_data.get("sender_name", "") or "").strip()
+        if sender_name:
+            return sender_name
+        if fallback_name:
+            return fallback_name
+        return f"用户{user_id}"
+
+    def _match_group_members_by_name(self, members, target_name: str) -> list[dict]:
+        normalized_target = self._normalize_match_name(target_name)
+        matches = []
+        seen_user_ids = set()
+
+        for member in members or []:
+            user_id = self._get_member_value(member, "user_id")
+            candidate_names = self._collect_member_match_names(member)
+            if not user_id or not candidate_names:
+                continue
+
+            matched_name = ""
+            for candidate_name in candidate_names:
+                if self._normalize_match_name(candidate_name) == normalized_target:
+                    matched_name = candidate_name
+                    break
+
+            if not matched_name:
+                continue
+            if user_id in seen_user_ids:
+                continue
+
+            matches.append({"user_id": user_id, "sender_name": matched_name})
+            seen_user_ids.add(user_id)
+
+        return matches
+
+    def _match_recorded_users_by_name(self, group_id: str, target_name: str) -> list[dict]:
+        normalized_target = self._normalize_match_name(target_name)
+        group_data = self.data.get("groups", {}).get(group_id, {})
+        matches = []
+
+        for user_id, user_data in group_data.items():
+            sender_name = str(user_data.get("sender_name", "") or "").strip()
+            if not sender_name:
+                continue
+            if self._normalize_match_name(sender_name) != normalized_target:
+                continue
+
+            matches.append({"user_id": str(user_id), "sender_name": sender_name})
+
+        return matches
+
+    async def _resolve_target_from_text(
+        self, event: AstrMessageEvent, group_id: str, target_text: str
+    ) -> dict:
+        cleaned_target = self._clean_target_name(target_text)
+        if not cleaned_target:
+            self._debug_log(
+                f"文本目标解析后为空: raw_target={target_text!r}, group_id={group_id}"
+            )
+            return {"status": "no_match", "target_name": ""}
+
+        self._debug_log(
+            f"开始按文本匹配目标: raw_target={target_text!r}, "
+            f"cleaned_target={cleaned_target!r}, group_id={group_id}"
+        )
+
+        try:
+            group = await event.get_group(group_id)
+            members = getattr(group, "members", None) or []
+            if members:
+                matches = self._match_group_members_by_name(members, cleaned_target)
+                raw_members = await self._fetch_aiocqhttp_group_members(event, group_id)
+                if raw_members:
+                    raw_matches = self._match_group_members_by_name(raw_members, cleaned_target)
+                    existing_user_ids = {match["user_id"] for match in matches}
+                    for match in raw_matches:
+                        if match["user_id"] in existing_user_ids:
+                            continue
+                        matches.append(match)
+                        existing_user_ids.add(match["user_id"])
+                self._debug_log(
+                    f"群成员匹配完成: target={cleaned_target!r}, "
+                    f"member_count={len(members)}, match_count={len(matches)}"
+                )
+                if len(matches) == 1:
+                    match = matches[0]
+                    self._debug_log(
+                        f"文本目标唯一命中群成员: user_id={match['user_id']}, "
+                        f"sender_name={match['sender_name']!r}"
+                    )
+                    return {
+                        "status": "ok",
+                        "target_id": match["user_id"],
+                        "sender_name": match["sender_name"],
+                        "target_name": cleaned_target,
+                    }
+                if len(matches) > 1:
+                    self._debug_log(
+                        f"文本目标命中多个群成员: target={cleaned_target!r}, "
+                        f"user_ids={[match['user_id'] for match in matches]}"
+                    )
+                    return {"status": "ambiguous", "target_name": cleaned_target}
+                self._debug_log(
+                    f"群成员中未命中文本目标，继续回退到已记录用户匹配: "
+                    f"target={cleaned_target!r}, group_id={group_id}"
+                )
+            else:
+                self._debug_log(
+                    f"当前平台未返回可用群成员列表，回退到已记录用户匹配: group_id={group_id}"
+                )
+        except Exception as e:
+            self._debug_log(
+                f"获取群成员失败，回退到已记录用户匹配: group_id={group_id}, error={e}"
+            )
+
+        matches = self._match_recorded_users_by_name(group_id, cleaned_target)
+        self._debug_log(
+            f"已记录用户匹配完成: target={cleaned_target!r}, match_count={len(matches)}"
+        )
+
+        if len(matches) == 1:
+            match = matches[0]
+            self._debug_log(
+                f"文本目标唯一命中已记录用户: user_id={match['user_id']}, "
+                f"sender_name={match['sender_name']!r}"
+            )
+            return {
+                "status": "ok",
+                "target_id": match["user_id"],
+                "sender_name": match["sender_name"],
+                "target_name": cleaned_target,
+            }
+        if len(matches) > 1:
+            self._debug_log(
+                f"文本目标命中多个已记录用户: target={cleaned_target!r}, "
+                f"user_ids={[match['user_id'] for match in matches]}"
+            )
+            return {"status": "ambiguous", "target_name": cleaned_target}
+        return {"status": "no_match", "target_name": cleaned_target}
+
     # ==================== 记录怪话 ====================
 
     @filter.command("记录")
@@ -277,6 +508,11 @@ class Wackee(Star):
 
             has_images = len(image_comps) > 0
             has_text = bool(content)
+            self._debug_log(
+                f"收到记录指令: group_id={group_id}, sender_id={sender_id}, "
+                f"sender_name={sender_name!r}, has_text={has_text}, "
+                f"has_images={has_images}, content={content!r}"
+            )
 
             if not has_text and not has_images:
                 yield event.plain_result("❌ 被引用的消息没有文本或图片内容，无法记录~")
@@ -365,6 +601,11 @@ class Wackee(Star):
                 return
 
             self._save_data()
+            self._debug_log(
+                f"记录完成: group_id={group_id}, sender_id={sender_id}, "
+                f"new_records={new_records}, updated_records={updated_records}, "
+                f"processed_count={processed_count}"
+            )
 
             unique_total = len(user_data["records"])
             occurrence_total = self._get_user_total_occurrences(user_data)
@@ -413,23 +654,74 @@ class Wackee(Star):
                 return
 
             target_id = None
+            target_name = ""
             for comp in msg_obj.message:
                 if isinstance(comp, Comp.At):
-                    target_id = str(comp.qq)
+                    qq = str(getattr(comp, "qq", "") or "").strip()
+                    if not qq or qq == "all":
+                        continue
+                    target_id = qq
+                    target_name = str(getattr(comp, "name", "") or "").strip()
                     break
+
+            self._debug_log(
+                f"收到来句怪话: group_id={group_id}, message_str={event.message_str!r}, "
+                f"has_real_at={bool(target_id)}, target_id={target_id!r}, "
+                f"target_name={target_name!r}"
+            )
 
             if target_id:
                 record_info = self._find_targeted_quote(group_id, target_id)
                 if record_info:
-                    yield self._build_quote_result(event, record_info)
+                    yield self._build_quote_result(
+                        event, record_info, target_id=target_id
+                    )
                 else:
-                    yield event.plain_result("没有找到该用户的怪话记录哦~")
+                    display_name = self._get_group_recorded_name(
+                        group_id, target_id, target_name
+                    )
+                    yield event.plain_result(f"没有找到 {display_name} 的怪话记录哦~")
             else:
-                record_info = self._find_random_quote(group_id)
-                if record_info:
-                    yield self._build_quote_result(event, record_info)
+                raw_target_text = self._extract_command_tail(
+                    event.message_str, "来句怪话"
+                )
+                cleaned_target_name = self._clean_target_name(raw_target_text)
+                self._debug_log(
+                    f"文本目标提取结果: raw_tail={raw_target_text!r}, "
+                    f"cleaned_target={cleaned_target_name!r}"
+                )
+
+                if raw_target_text:
+                    target_info = await self._resolve_target_from_text(
+                        event, group_id, raw_target_text
+                    )
+                    status = target_info.get("status")
+                    if status == "ok":
+                        target_id = target_info["target_id"]
+                        target_name = target_info["sender_name"]
+                        record_info = self._find_targeted_quote(group_id, target_id)
+                        if record_info:
+                            yield self._build_quote_result(
+                                event, record_info, target_id=target_id
+                            )
+                        else:
+                            yield event.plain_result(
+                                f"没有找到 {target_name} 的怪话记录哦~"
+                            )
+                    elif status == "ambiguous":
+                        yield event.plain_result(
+                            "找到多个同名群友，请使用真实@后再试哦~"
+                        )
+                    else:
+                        yield event.plain_result(
+                            "没有找到匹配的群友，请检查昵称或使用真实@哦~"
+                        )
                 else:
-                    yield event.plain_result("本群还没有任何怪话记录哦~")
+                    record_info = self._find_random_quote(group_id)
+                    if record_info:
+                        yield self._build_quote_result(event, record_info)
+                    else:
+                        yield event.plain_result("本群还没有任何怪话记录哦~")
 
         except Exception as e:
             logger.error(f"[Wackee] 发送怪话异常: {e}")
@@ -453,8 +745,9 @@ class Wackee(Star):
             "\n"
             "3. 来句怪话 @某人\n"
             "功能：随机发送指定用户的一条怪话。\n"
-            "用法：发送“来句怪话 @某人”。\n"
-            "说明：如果开启跨群搜索，本群没有记录时会去其他群查找。\n"
+            "用法：发送“来句怪话 @某人”或“来句怪话 某人”。\n"
+            "说明：如果 @ 没有成功应用，会尝试按群昵称唯一匹配；若同名多人，请使用真实@。\n"
+            "如果开启跨群搜索，本群没有记录时会去其他群查找。\n"
             "\n"
             "4. 怪话排行\n"
             "功能：显示当前群里怪话累计出现次数最多的人。\n"
@@ -571,7 +864,7 @@ class Wackee(Star):
     # ==================== 辅助方法 ====================
 
     def _build_quote_result(
-        self, event: AstrMessageEvent, record_info: dict
+        self, event: AstrMessageEvent, record_info: dict, target_id: str | None = None
     ) -> MessageEventResult:
         """根据记录信息构建消息结果（支持图片和文本）"""
         sender_name = record_info["sender_name"]
@@ -582,10 +875,14 @@ class Wackee(Star):
         header = f"📢 {sender_name} 曾说过：\n"
         content_text = record.get("content", "")
         footer = f"\n—— {record['time']}（已被发送 {count} 次）"
+        lead_text = f"\n{header}" if target_id else header
 
         if record_type == "image":
             image_path = record.get("image_path", "")
-            chain = [Comp.Plain(text=header)]
+            chain = []
+            if target_id:
+                chain.append(Comp.At(qq=target_id))
+            chain.append(Comp.Plain(text=lead_text))
 
             if content_text:
                 chain.append(Comp.Plain(text=f"「{content_text}」\n"))
@@ -598,21 +895,28 @@ class Wackee(Star):
             chain.append(Comp.Plain(text=footer))
             return event.chain_result(chain)
 
-        text = f"{header}「{content_text}」{footer}"
+        text = f"{lead_text}「{content_text}」{footer}"
+        if target_id:
+            return event.chain_result([Comp.At(qq=target_id), Comp.Plain(text=text)])
         return event.plain_result(text)
 
     def _find_targeted_quote(self, group_id: str, target_id: str):
         """查找指定用户的随机怪话，支持跨群搜索"""
+        self._debug_log(
+            f"开始查找定向怪话: group_id={group_id}, target_id={target_id}"
+        )
         result = self._pick_random_from_user(group_id, target_id)
         if result:
+            self._debug_log(
+                f"在当前群命中定向怪话: group_id={group_id}, target_id={target_id}"
+            )
             return result
 
-        cross_group = False
-        if self.config:
-            try:
-                cross_group = self.config.get("cross_group_search", False)
-            except Exception:
-                cross_group = False
+        cross_group = self._get_config_bool("cross_group_search", False)
+        self._debug_log(
+            f"当前群未命中定向怪话: group_id={group_id}, "
+            f"target_id={target_id}, cross_group_search={cross_group}"
+        )
 
         if not cross_group:
             return None
@@ -622,8 +926,14 @@ class Wackee(Star):
                 continue
             result = self._pick_random_from_user(gid, target_id)
             if result:
+                self._debug_log(
+                    f"跨群命中定向怪话: source_group_id={gid}, target_id={target_id}"
+                )
                 return result
 
+        self._debug_log(
+            f"定向怪话查找失败: group_id={group_id}, target_id={target_id}"
+        )
         return None
 
     def _pick_random_from_user(self, group_id: str, target_id: str):

@@ -1,6 +1,6 @@
 name: astrbot_plugin_wackee
 display_name: Wackee 怪话记录器
-desc: 记录群友的怪话（支持文本和图片）、统计群聊怪话排行，并在被@时随机发送一句，支持跨群搜索。
-version: v1.1.0
+desc: 记录群友的怪话（支持文本和图片）、统计群聊怪话排行，并在被@或按昵称/名片匹配时随机发送一句，支持跨群搜索。
+version: v1.1.2
 author: storyAura
 repo: https://github.com/storyAura/astrbot_plugin_Wackee
