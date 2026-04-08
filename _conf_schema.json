@@ -1,0 +1,8 @@
+{
+    "cross_group_search": {
+        "description": "跨群搜索",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，当本群没有该用户的怪话记录时，会搜索其他群的记录。默认关闭。"
+    }
+}
